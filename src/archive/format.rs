@@ -5,17 +5,20 @@ use std::{
     path::Path,
 };
 
-const FOOTER_MAGIC: &[u8; 8] = b"VPKFOOT\0";
+const FOOTER_MAGIC: &[u8; 8] = b"SPZSTD1\0";
 const FOOTER_SIZE: u64 = 33;
 const IS_LAUNCHED: u8 = 1;
-const MIN_ENTRY_SIZE: u64 = 20;
+const MIN_ENTRY_SIZE: u64 = 28;
 const MAX_NAME_SIZE: usize = 4096;
+const MAX_DECOMPRESSED_PAYLOAD_SIZE: u64 = 1024 * 1024 * 1024;
+const ZSTD_COMPRESSION_LEVEL: i32 = 15;
 
 /// A single packed payload entry stored in the manifest.
 struct Entry {
     name: String,
     offset: u64,
-    size: u64,
+    compressed_size: u64,
+    decompressed_size: u64,
 }
 
 /// Read a little-endian `u32` from the current file position.
@@ -56,7 +59,21 @@ where
                 format!("failed to open payload {}: {err}", payload_path.display()),
             )
         })?;
-        let size = io::copy(&mut payload, &mut output)?;
+        let decompressed_size = payload.metadata()?.len();
+
+        if decompressed_size > MAX_DECOMPRESSED_PAYLOAD_SIZE {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "payload exceeds the 1 GiB decompressed-size limit",
+            ));
+        }
+
+        let mut encoder = zstd::stream::write::Encoder::new(&mut output, ZSTD_COMPRESSION_LEVEL)?;
+        encoder.include_checksum(true)?;
+        io::copy(&mut payload, &mut encoder)?;
+        encoder.finish()?;
+
+        let compressed_size = output.stream_position()? - offset;
         let name = payload_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -67,7 +84,12 @@ where
             return Err(Error::new(ErrorKind::InvalidInput, "payload file name is too long"));
         }
 
-        entries.push(Entry { name, offset, size });
+        entries.push(Entry {
+            name,
+            offset,
+            compressed_size,
+            decompressed_size,
+        });
     }
 
     // The manifest is appended after the launcher + payload blobs.
@@ -81,7 +103,8 @@ where
         output.write_all(&name_len.to_le_bytes())?;
         output.write_all(name_bytes)?;
         output.write_all(&entry.offset.to_le_bytes())?;
-        output.write_all(&entry.size.to_le_bytes())?;
+        output.write_all(&entry.compressed_size.to_le_bytes())?;
+        output.write_all(&entry.decompressed_size.to_le_bytes())?;
     }
 
     let manifest_size = output.stream_position()? - manifest_offset;
@@ -163,7 +186,7 @@ where
 
         let entry_tail = u64::try_from(name_len)
             .ok()
-            .and_then(|name_len| name_len.checked_add(16))
+            .and_then(|name_len| name_len.checked_add(24))
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "manifest entry size overflow"))?;
         ensure_available(&mut file, manifest_end, entry_tail)?;
 
@@ -174,10 +197,11 @@ where
             .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8 in file name"))?;
 
         let offset = read_u64(&mut file)?;
-        let size = read_u64(&mut file)?;
+        let compressed_size = read_u64(&mut file)?;
+        let decompressed_size = read_u64(&mut file)?;
 
         let payload_end = offset
-            .checked_add(size)
+            .checked_add(compressed_size)
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "payload range overflow"))?;
 
         if payload_end > manifest_offset {
@@ -187,21 +211,60 @@ where
             ));
         }
 
-        entries.push(Entry { name, offset, size });
+        if decompressed_size > MAX_DECOMPRESSED_PAYLOAD_SIZE {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "decompressed payload exceeds the safety limit",
+            ));
+        }
+
+        entries.push(Entry {
+            name,
+            offset,
+            compressed_size,
+            decompressed_size,
+        });
     }
 
     if file.stream_position()? != manifest_end {
         return Err(Error::new(ErrorKind::InvalidData, "manifest contains trailing data"));
     }
 
-    let (offset, size) = find_optimal(&entries, &native_hash)?;
+    let entry = find_optimal(&entries, &native_hash)?;
+    decompress_payload(&mut file, entry)
+}
 
-    let payload_size = usize::try_from(size)
+fn decompress_payload(file: &mut File, entry: &Entry) -> io::Result<Vec<u8>> {
+    let payload_size = usize::try_from(entry.decompressed_size)
         .map_err(|_| Error::new(ErrorKind::InvalidData, "payload is too large for this platform"))?;
-    let mut payload = vec![0u8; payload_size];
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_size)
+        .map_err(|error| Error::other(format!("could not allocate decompressed payload: {error}")))?;
+    payload.resize(payload_size, 0);
 
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut payload)?;
+    file.seek(SeekFrom::Start(entry.offset))?;
+    let compressed = file.take(entry.compressed_size);
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, format!("invalid zstd payload: {error}")))?;
+
+    decoder
+        .read_exact(&mut payload)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, format!("could not decompress payload: {error}")))?;
+
+    let mut extra = [0u8; 1];
+    if decoder.read(&mut extra).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("could not finish zstd payload: {error}"),
+        )
+    })? != 0
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "decompressed payload is larger than its manifest size",
+        ));
+    }
 
     Ok(payload)
 }
@@ -223,16 +286,16 @@ fn ensure_available(file: &mut File, end: u64, size: u64) -> io::Result<()> {
 }
 
 /// Pick the payload that best matches the CPU's supported x86-64 level.
-fn find_optimal(entries: &[Entry], native_hash: &[u8]) -> io::Result<(u64, u64)> {
+fn find_optimal<'a>(entries: &'a [Entry], native_hash: &[u8]) -> io::Result<&'a Entry> {
     select_optimal(entries, native_hash, detect_x86_level(), native_hasher())
 }
 
-fn select_optimal(
-    entries: &[Entry],
+fn select_optimal<'a>(
+    entries: &'a [Entry],
     native_hash: &[u8],
     level: X86Level,
     current_native_hash: Option<u64>,
-) -> io::Result<(u64, u64)> {
+) -> io::Result<&'a Entry> {
     if let Some(hash) = current_native_hash
         && hash.to_le_bytes() == native_hash
     {
@@ -240,7 +303,7 @@ fn select_optimal(
             let label = payload_label(&entry.name);
 
             if label_matches(label, "native") {
-                return Ok((entry.offset, entry.size));
+                return Ok(entry);
             }
         }
     }
@@ -262,7 +325,7 @@ fn select_optimal(
             let label = payload_label(&entry.name);
 
             if label_matches(label, wanted) || label_matches(label, &wanted_with_underscores) {
-                return Ok((entry.offset, entry.size));
+                return Ok(entry);
             }
         }
     }
@@ -420,16 +483,22 @@ mod tests {
             Entry {
                 name: "c-x86-64".to_string(),
                 offset: 10,
-                size: 1,
+                compressed_size: 1,
+                decompressed_size: 11,
             },
             Entry {
                 name: "c-x86-64-v2".to_string(),
                 offset: 20,
-                size: 2,
+                compressed_size: 2,
+                decompressed_size: 22,
             },
         ];
 
-        assert_eq!(select_optimal(&entries, &[0; 8], X86Level::V4, None)?, (20, 2));
+        let selected = select_optimal(&entries, &[0; 8], X86Level::V4, None)?;
+        assert_eq!(
+            (selected.offset, selected.compressed_size, selected.decompressed_size),
+            (20, 2, 22)
+        );
         Ok(())
     }
 
@@ -438,10 +507,55 @@ mod tests {
         let entries = vec![Entry {
             name: "rust-x86_64_v3.exe".to_string(),
             offset: 42,
-            size: 7,
+            compressed_size: 7,
+            decompressed_size: 70,
         }];
 
-        assert_eq!(select_optimal(&entries, &[0; 8], X86Level::V3, None)?, (42, 7));
+        let selected = select_optimal(&entries, &[0; 8], X86Level::V3, None)?;
+        assert_eq!((selected.offset, selected.compressed_size), (42, 7));
+        Ok(())
+    }
+
+    #[test]
+    fn payloads_are_zstd_compressed() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let launcher = dir.path().join("launcher");
+        let payload = dir.path().join("c-x86-64");
+        let output = dir.path().join("packed");
+        let payload_bytes = vec![b'A'; 64 * 1024];
+
+        fs::write(&launcher, b"launcher")?;
+        fs::write(&payload, &payload_bytes)?;
+        pack_files(&launcher, &output, &[payload.display().to_string()])?;
+
+        assert!(fs::metadata(&output)?.len() < payload_bytes.len() as u64);
+        assert_eq!(read_back(&output)?, payload_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_zstd_payload_is_rejected() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let launcher = dir.path().join("launcher");
+        let payload = dir.path().join("c-x86-64");
+        let output = dir.path().join("packed");
+
+        fs::write(&launcher, b"launcher")?;
+        fs::write(&payload, vec![b'A'; 64 * 1024])?;
+        pack_files(&launcher, &output, &[payload.display().to_string()])?;
+
+        let mut file = OpenOptions::new().read(true).write(true).open(&output)?;
+        file.seek(SeekFrom::End(-25))?;
+        let manifest_offset = read_u64(&mut file)?;
+        file.seek(SeekFrom::Start(manifest_offset - 1))?;
+
+        let mut checksum_byte = [0u8; 1];
+        file.read_exact(&mut checksum_byte)?;
+        checksum_byte[0] ^= 0xff;
+        file.seek(SeekFrom::Start(manifest_offset - 1))?;
+        file.write_all(&checksum_byte)?;
+
+        assert_eq!(read_back(&output).unwrap_err().kind(), ErrorKind::InvalidData);
         Ok(())
     }
 

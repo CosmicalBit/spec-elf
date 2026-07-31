@@ -5,7 +5,7 @@ launcher executable.
 
 ```text
 [launcher executable]
-[payload bytes]
+[independent Zstandard payload frames]
 [manifest]
 [footer]
 ```
@@ -22,18 +22,24 @@ repeated entry_count times:
     u32 name_length
     u8[name_length] name_utf8
     u64 payload_offset
-    u64 payload_size
+    u64 compressed_size
+    u64 decompressed_size
 ```
 
-Payload offsets are absolute from the beginning of the packed file. Payload ranges must end before the manifest begins.
-Payload names are UTF-8 and limited to 4096 bytes.
+Payload offsets are absolute from the beginning of the packed file. Each payload is an independent Zstandard frame,
+compressed at level 3 with a frame checksum. Independent frames allow the launcher to read and decompress only the
+selected CPU variant. Compressed payload ranges must end before the manifest begins.
+
+Payload names are UTF-8 and limited to 4096 bytes. A declared decompressed payload size above 1 GiB is rejected before
+allocation. Extraction must produce exactly `decompressed_size` bytes; shorter, longer, corrupt, or checksum-invalid
+frames are rejected.
 
 ## Footer
 
 The footer is the final 33 bytes:
 
 ```text
-u8[8] magic             "VPKFOOT\0"
+u8[8] magic             "SPZSTD1\0"
 u64   manifest_offset
 u64   manifest_size
 u64   native_cpu_hash
@@ -43,6 +49,9 @@ u8    launch_flag       1
 The final byte is a format marker rather than mutable launch state; it must always be <code>1</code>. The manifest must
 end exactly where the footer begins. The reader also rejects overflowing ranges, impossible entry counts, oversized
 names, trailing manifest data, and payloads that overlap the manifest.
+
+`SPZSTD1\0` identifies the first Zstandard-compressed format. Older uncompressed archives used a different magic value
+and are intentionally not treated as compatible archives by this launcher.
 
 ## Payload selection
 

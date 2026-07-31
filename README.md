@@ -28,8 +28,8 @@
   <tr>
     <th align="left">Variants</th>
     <td>native, baseline, v2, v3, v4</td>
-    <th align="left">Selection</th>
-    <td>Automatic at launch</td>
+    <th align="left">Compression</th>
+    <td>Zstandard, per payload</td>
   </tr>
 </table>
 
@@ -148,7 +148,8 @@
 
 <ol>
   <li>Build five CPU-specific versions of the project.</li>
-  <li>Append those payloads and a manifest to the launcher.</li>
+  <li>Compress each payload independently with Zstandard.</li>
+  <li>Append the compressed frames and a manifest to the launcher.</li>
   <li>Detect the current CPU's x86-64 feature level at runtime.</li>
   <li>Extract the best matching payload to a temporary sibling file.</li>
   <li>On Linux, atomically replace the launcher and execute the selected payload.</li>
@@ -175,6 +176,7 @@
     <li>CMake packaging expects exactly one executable in its configured runtime output directory.</li>
     <li>Rust supports the default binary or one explicit <code>[[bin]]</code>; multiple explicit binaries require a future selection option.</li>
     <li>Zig currently builds the first <code>.zig</code> source found.</li>
+    <li>Each decompressed payload is limited to 1 GiB.</li>
     <li>On Windows, remove an existing packed output before rebuilding it; Windows does not allow the final rename to replace an existing file.</li>
   </ul>
 </details>

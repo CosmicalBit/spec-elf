@@ -65,12 +65,13 @@ main
 
 | Function | Visibility | What it does |
 | --- | --- | --- |
-| `pack_files(launcher_path, output_path, payload_paths)` | **Public** | Creates a new archive, copies the launcher and payloads, then appends the manifest and footer. Refuses to overwrite an existing output. |
-| `read_back(path)` | **Public** | Validates the footer and manifest, selects the best compatible payload, and returns its bytes. |
+| `pack_files(launcher_path, output_path, payload_paths)` | **Public** | Creates a new archive, copies the launcher, compresses each payload as an independent checksummed Zstandard frame, then appends the manifest and footer. Refuses to overwrite an existing output. |
+| `read_back(path)` | **Public** | Validates the footer and manifest, selects the best compatible payload, decompresses it, and returns its original bytes. |
 | `is_archive(path)` | **Public** | Checks the fixed footer magic and marker without parsing or extracting the complete archive. |
 | `read_u32(file)` | Internal | Reads one little-endian `u32` from the current file position. |
 | `read_u64(file)` | Internal | Reads one little-endian `u64` from the current file position. |
 | `ensure_available(file, end, size)` | Internal | Verifies that a manifest read stays inside the declared manifest range and cannot overflow. |
+| `decompress_payload(file, entry)` | Internal | Decompresses only the selected Zstandard frame, verifies its checksum and exact declared size, and enforces the 1 GiB safety limit. |
 | `find_optimal(entries, native_hash)` | Internal | Supplies the current CPU level and native identity to the deterministic selection function. |
 | `select_optimal(entries, native_hash, level, current_native_hash)` | Internal | Selects matching `native` first, then falls back from the highest supported standardized level to baseline. |
 | `payload_label(name)` | Internal | Removes a final case-insensitive `.exe` extension before payload-name matching. |
@@ -105,6 +106,8 @@ compatible fallback.
 | `selection_falls_back_to_a_lower_level` | Failing when the exact highest variant is absent. |
 | `selection_accepts_windows_executable_names` | Mishandling `.exe` suffixes or mixed `-`/`_` target names. |
 | `malformed_manifest_range_is_rejected` | Integer overflow and invalid manifest ranges. |
+| `payloads_are_zstd_compressed` | Accidentally storing raw payload bytes or breaking Zstandard round trips. |
+| `corrupted_zstd_payload_is_rejected` | Accepting payloads that fail Zstandard frame checksum validation. |
 | `language_detection_ignores_c_headers` | Misclassifying C++ projects because of shared C headers. |
 | `language_detection_rejects_ties` | Silently choosing one language when source counts tie. |
 | `reads_explicit_cargo_binary_name` | Copying the wrong Rust executable when `[[bin]]` differs from the package name. |
