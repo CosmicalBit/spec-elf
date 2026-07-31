@@ -7,7 +7,9 @@ use std::{
 
 const FOOTER_MAGIC: &[u8; 8] = b"VPKFOOT\0";
 const FOOTER_SIZE: u64 = 33;
-const IS_LAUNCHED: u8 = 1; // use to be written in the launcher, must be 1
+const IS_LAUNCHED: u8 = 1;
+const MIN_ENTRY_SIZE: u64 = 20;
+const MAX_NAME_SIZE: usize = 4096;
 
 /// A single packed payload entry stored in the manifest.
 struct Entry {
@@ -36,7 +38,9 @@ where
     P: AsRef<Path>,
     O: AsRef<Path>,
 {
-    let mut output = OpenOptions::new().create(true).truncate(true).write(true).open(output_path)?;
+    let entry_count =
+        u32::try_from(payload_paths.len()).map_err(|_| Error::new(ErrorKind::InvalidInput, "too many payloads"))?;
+    let mut output = OpenOptions::new().create_new(true).write(true).open(output_path)?;
 
     let mut launcher = File::open(launcher_path)?;
     io::copy(&mut launcher, &mut output)?;
@@ -46,20 +50,35 @@ where
     for payload_path in payload_paths {
         let payload_path = Path::new(payload_path);
         let offset = output.stream_position()?;
-        let mut payload = File::open(payload_path).map_err(|err| Error::new(err.kind(), format!("failed to open payload {}: {err}", payload_path.display())))?;
+        let mut payload = File::open(payload_path).map_err(|err| {
+            Error::new(
+                err.kind(),
+                format!("failed to open payload {}: {err}", payload_path.display()),
+            )
+        })?;
         let size = io::copy(&mut payload, &mut output)?;
-        let name = payload_path.file_name().and_then(|name| name.to_str()).ok_or_else(|| Error::new(ErrorKind::InvalidInput, "payload path has no valid file name"))?.to_string();
+        let name = payload_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "payload path has no valid file name"))?
+            .to_string();
+
+        if name.len() > MAX_NAME_SIZE {
+            return Err(Error::new(ErrorKind::InvalidInput, "payload file name is too long"));
+        }
 
         entries.push(Entry { name, offset, size });
     }
 
     // The manifest is appended after the launcher + payload blobs.
     let manifest_offset = output.stream_position()?;
-    output.write_all(&(entries.len() as u32).to_le_bytes())?;
+    output.write_all(&entry_count.to_le_bytes())?;
 
     for entry in &entries {
         let name_bytes = entry.name.as_bytes();
-        output.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+        let name_len = u32::try_from(name_bytes.len())
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "payload file name is too long"))?;
+        output.write_all(&name_len.to_le_bytes())?;
         output.write_all(name_bytes)?;
         output.write_all(&entry.offset.to_le_bytes())?;
         output.write_all(&entry.size.to_le_bytes())?;
@@ -70,15 +89,11 @@ where
     output.write_all(&manifest_offset.to_le_bytes())?;
     output.write_all(&manifest_size.to_le_bytes())?;
 
-    let native_hash = native_hasher();
-
-    match native_hash {
+    match native_hasher() {
         Some(v) => output.write_all(&v.to_le_bytes())?,
-        None => output.write_all(&((0 as u64).to_le_bytes()))?,
+        None => output.write_all(&0u64.to_le_bytes())?,
     }
 
-    // Reserved flag for launch bookkeeping.
-    // is launched needs to be 1
     output.write_all(&[IS_LAUNCHED])?;
 
     Ok(())
@@ -109,8 +124,21 @@ where
     // Footer layout: magic, manifest offset, manifest size, native hash, launch flag.
     let manifest_offset = read_u64(&mut file)?;
     let manifest_size = read_u64(&mut file)?;
+    let mut native_hash = [0u8; 8];
+    file.read_exact(&mut native_hash)?;
+    let mut launch_flag = [0u8; 1];
+    file.read_exact(&mut launch_flag)?;
 
-    if manifest_offset + manifest_size > file_size - FOOTER_SIZE {
+    if launch_flag[0] != IS_LAUNCHED {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid launch flag"));
+    }
+
+    let manifest_end = manifest_offset
+        .checked_add(manifest_size)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "manifest range overflow"))?;
+    let footer_offset = file_size - FOOTER_SIZE;
+
+    if manifest_size < 4 || manifest_end != footer_offset {
         return Err(Error::new(ErrorKind::InvalidData, "invalid manifest range"));
     }
 
@@ -118,68 +146,141 @@ where
 
     let entry_count = read_u32(&mut file)?;
 
+    if u64::from(entry_count) > (manifest_size - 4) / MIN_ENTRY_SIZE {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid manifest entry count"));
+    }
+
     // Each manifest entry stores the payload name and its byte range.
     let mut entries = Vec::with_capacity(entry_count as usize);
 
     for _ in 0..entry_count {
+        ensure_available(&mut file, manifest_end, 4)?;
         let name_len = read_u32(&mut file)? as usize;
+
+        if name_len > MAX_NAME_SIZE {
+            return Err(Error::new(ErrorKind::InvalidData, "payload file name is too long"));
+        }
+
+        let entry_tail = u64::try_from(name_len)
+            .ok()
+            .and_then(|name_len| name_len.checked_add(16))
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "manifest entry size overflow"))?;
+        ensure_available(&mut file, manifest_end, entry_tail)?;
 
         let mut name_bytes = vec![0u8; name_len];
         file.read_exact(&mut name_bytes)?;
 
-        let name = String::from_utf8(name_bytes).map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8 in file name"))?;
+        let name = String::from_utf8(name_bytes)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8 in file name"))?;
 
         let offset = read_u64(&mut file)?;
         let size = read_u64(&mut file)?;
 
+        let payload_end = offset
+            .checked_add(size)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "payload range overflow"))?;
+
+        if payload_end > manifest_offset {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "payload range overlaps the manifest",
+            ));
+        }
+
         entries.push(Entry { name, offset, size });
     }
 
-    file.seek(SeekFrom::End(-9))?;
-    let mut native_hash = [0u8; 8];
-    file.read_exact(&mut native_hash)?;
+    if file.stream_position()? != manifest_end {
+        return Err(Error::new(ErrorKind::InvalidData, "manifest contains trailing data"));
+    }
 
     let (offset, size) = find_optimal(&entries, &native_hash)?;
 
-    let mut correct_exe = vec![0u8; size as usize];
+    let payload_size = usize::try_from(size)
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "payload is too large for this platform"))?;
+    let mut payload = vec![0u8; payload_size];
 
     file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut correct_exe)?;
+    file.read_exact(&mut payload)?;
 
-    Ok(correct_exe)
+    Ok(payload)
+}
+
+fn ensure_available(file: &mut File, end: u64, size: u64) -> io::Result<()> {
+    let position = file.stream_position()?;
+    let requested_end = position
+        .checked_add(size)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "manifest range overflow"))?;
+
+    if requested_end > end {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "manifest entry extends beyond the manifest",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Pick the payload that best matches the CPU's supported x86-64 level.
 fn find_optimal(entries: &[Entry], native_hash: &[u8]) -> io::Result<(u64, u64)> {
-    let level = detect_x86_level();
+    select_optimal(entries, native_hash, detect_x86_level(), native_hasher())
+}
 
-    // if the hashes are equal we itenerate and see if one contains native as part of name, if yes we return the offset and size if this is not true we just continue default path
-    if let Some(b) = native_hasher() {
-        //return the native as a choice
-        if b.to_le_bytes() == native_hash {
-            for entry in entries {
-                if entry.name.contains("native") {
-                    return Ok((entry.offset, entry.size));
-                }
+fn select_optimal(
+    entries: &[Entry],
+    native_hash: &[u8],
+    level: X86Level,
+    current_native_hash: Option<u64>,
+) -> io::Result<(u64, u64)> {
+    if let Some(hash) = current_native_hash
+        && hash.to_le_bytes() == native_hash
+    {
+        for entry in entries {
+            let label = payload_label(&entry.name);
+
+            if label_matches(label, "native") {
+                return Ok((entry.offset, entry.size));
             }
         }
     }
 
-    let wanted = match level {
-        X86Level::V4 => "x86-64-v4",
-        X86Level::V3 => "x86-64-v3",
-        X86Level::V2 => "x86-64-v2",
-        X86Level::X86_64 => "x86-64",
-    };
-    let wanted_with_underscores = wanted.replace('-', "_");
+    for candidate in [X86Level::V4, X86Level::V3, X86Level::V2, X86Level::X86_64] {
+        if candidate > level {
+            continue;
+        }
 
-    for entry in entries {
-        if entry.name == wanted || entry.name.ends_with(wanted) || entry.name == wanted_with_underscores || entry.name.ends_with(&wanted_with_underscores) || entry.name == format!("-march={wanted}") {
-            return Ok((entry.offset, entry.size));
+        let wanted = match candidate {
+            X86Level::V4 => "x86-64-v4",
+            X86Level::V3 => "x86-64-v3",
+            X86Level::V2 => "x86-64-v2",
+            X86Level::X86_64 => "x86-64",
+        };
+        let wanted_with_underscores = wanted.replace('-', "_");
+
+        for entry in entries {
+            let label = payload_label(&entry.name);
+
+            if label_matches(label, wanted) || label_matches(label, &wanted_with_underscores) {
+                return Ok((entry.offset, entry.size));
+            }
         }
     }
 
     Err(io::Error::new(io::ErrorKind::NotFound, "no compatible binary found"))
+}
+
+fn payload_label(name: &str) -> &str {
+    name.rsplit_once('.')
+        .filter(|(_, extension)| extension.eq_ignore_ascii_case("exe"))
+        .map_or(name, |(stem, _)| stem)
+}
+
+fn label_matches(label: &str, target: &str) -> bool {
+    label == target
+        || label
+            .strip_suffix(target)
+            .is_some_and(|prefix| prefix.ends_with(['-', '_']))
 }
 
 pub fn is_archive<P>(path: P) -> io::Result<bool>
@@ -196,16 +297,15 @@ where
 
     file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
 
-    let mut identifier = [0u8; 8];
-    file.read_exact(&mut identifier)?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)?;
 
-    //check the last byte bcs it is a u8 FOOTER_IS_LAUNCHED
-    if &identifier == FOOTER_MAGIC {
+    if &magic == FOOTER_MAGIC {
         file.seek(SeekFrom::End(-1))?;
         let mut is_launched = [0u8; 1];
         file.read_exact(&mut is_launched)?;
 
-        if is_launched[0] == 1 {
+        if is_launched[0] == IS_LAUNCHED {
             return Ok(true);
         }
     }
@@ -251,7 +351,13 @@ mod tests {
         fs::write(&v3, b"x86-64-v3 payload")?;
         fs::write(&v4, b"x86-64-v4 payload")?;
 
-        let payloads = vec![native.display().to_string(), x86_64.display().to_string(), v2.display().to_string(), v3.display().to_string(), v4.display().to_string()];
+        let payloads = vec![
+            native.display().to_string(),
+            x86_64.display().to_string(),
+            v2.display().to_string(),
+            v3.display().to_string(),
+            v4.display().to_string(),
+        ];
 
         pack_files(&launcher, &output, &payloads)?;
 
@@ -280,7 +386,13 @@ mod tests {
         fs::write(&v3, b"x86-64-v3 payload")?;
         fs::write(&v4, b"x86-64-v4 payload")?;
 
-        let payloads = vec![native.display().to_string(), x86_64.display().to_string(), v2.display().to_string(), v3.display().to_string(), v4.display().to_string()];
+        let payloads = vec![
+            native.display().to_string(),
+            x86_64.display().to_string(),
+            v2.display().to_string(),
+            v3.display().to_string(),
+            v4.display().to_string(),
+        ];
 
         pack_files(&launcher, &output, &payloads)?;
 
@@ -299,6 +411,56 @@ mod tests {
 
         assert_eq!(actual, expected);
 
+        Ok(())
+    }
+
+    #[test]
+    fn selection_falls_back_to_a_lower_level() -> io::Result<()> {
+        let entries = vec![
+            Entry {
+                name: "c-x86-64".to_string(),
+                offset: 10,
+                size: 1,
+            },
+            Entry {
+                name: "c-x86-64-v2".to_string(),
+                offset: 20,
+                size: 2,
+            },
+        ];
+
+        assert_eq!(select_optimal(&entries, &[0; 8], X86Level::V4, None)?, (20, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn selection_accepts_windows_executable_names() -> io::Result<()> {
+        let entries = vec![Entry {
+            name: "rust-x86_64_v3.exe".to_string(),
+            offset: 42,
+            size: 7,
+        }];
+
+        assert_eq!(select_optimal(&entries, &[0; 8], X86Level::V3, None)?, (42, 7));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_manifest_range_is_rejected() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let launcher = dir.path().join("launcher");
+        let payload = dir.path().join("c-x86-64");
+        let output = dir.path().join("packed");
+
+        fs::write(&launcher, b"fake launcher")?;
+        fs::write(&payload, b"payload")?;
+        pack_files(&launcher, &output, &[payload.display().to_string()])?;
+
+        let mut file = OpenOptions::new().write(true).open(&output)?;
+        file.seek(SeekFrom::End(-17))?;
+        file.write_all(&u64::MAX.to_le_bytes())?;
+
+        assert_eq!(read_back(&output).unwrap_err().kind(), ErrorKind::InvalidData);
         Ok(())
     }
 }

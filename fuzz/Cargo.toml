@@ -9,27 +9,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+tempfile = "3"
 
 [dependencies.spec-elf]
 path = ".."
 
 [[bin]]
-name = "fuzz_target_1"
-path = "fuzz_targets/fuzz_target_1.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "help"
-path = "fuzz_targets/help.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "main"
-path = "fuzz_targets/main.rs"
+name = "archive"
+path = "fuzz_targets/archive.rs"
 test = false
 doc = false
 bench = false

@@ -1,153 +1,201 @@
 <div align="center">
-  <h1>⚙️ spec-elf</h1>
-  <p><strong>One ELF, optimized for every x86-64 CPU level.</strong></p>
+  <h1>spec-elf</h1>
+  <p><strong>One executable. Five x86-64 builds. The best one selected automatically.</strong></p>
   <p>
-    <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-DEA584?logo=rust&amp;logoColor=white">
-    <img alt="Linux x86-64" src="https://img.shields.io/badge/platform-Linux%20x86--64-FCC624?logo=linux&amp;logoColor=black">
-    <img alt="C, C++, Rust, Zig" src="https://img.shields.io/badge/projects-C%20%7C%20C%2B%2B%20%7C%20Rust%20%7C%20Zig-2F81F7">
-    <img alt="Status: experimental" src="https://img.shields.io/badge/status-experimental-F0A202">
+    <a href="#quick-start">Quick start</a> ·
+    <a href="#supported-projects">Supported projects</a> ·
+    <a href="#how-it-works">How it works</a> ·
+    <a href="docs/functions.md">Function cheat sheet</a> ·
+    <a href="docs/format.md">File format</a>
   </p>
-  <p>Build five optimized variants of a project, package them behind a small launcher, and select the best compatible payload on first run.</p>
 </div>
 
 <hr>
 
-<h2>What it produces</h2>
+<p>
+  <code>spec-elf</code> packages multiple x86-64 builds of a project into a single Linux ELF or Windows PE executable.
+  At runtime, it detects the host CPU and launches the best compatible payload. Linux specializes the packed file
+  permanently on first run; Windows uses a temporary executable because a running <code>.exe</code> cannot replace itself.
+</p>
 
-<p><code>spec-elf</code> detects the project language, builds CPU-specific executables, and appends them to one Linux ELF with a compact manifest and footer.</p>
+<table>
+  <tr>
+    <th align="left">Platforms</th>
+    <td>Linux and Windows x86-64</td>
+    <th align="left">Languages</th>
+    <td>C, C++, Rust, Zig</td>
+  </tr>
+  <tr>
+    <th align="left">Variants</th>
+    <td>native, baseline, v2, v3, v4</td>
+    <th align="left">Selection</th>
+    <td>Automatic at launch</td>
+  </tr>
+</table>
+
+<h2 id="quick-start">Quick start</h2>
+
+<h3>1. Build spec-elf</h3>
+
+<pre><code class="language-bash">cargo build --release</code></pre>
+
+<p>
+  The launcher is written to <code>target/release/spec-elf</code> on Linux and
+  <code>target/release/spec-elf.exe</code> on Windows.
+</p>
+
+<h3>2. Package a project</h3>
+
+<p>Pass the project directory explicitly. Use <code>.</code> for the current directory.</p>
+
+<pre><code class="language-bash">cd /path/to/project
+/path/to/spec-elf/target/release/spec-elf .</code></pre>
+
+<p>Or package it from elsewhere:</p>
+
+<pre><code class="language-bash">/path/to/spec-elf/target/release/spec-elf /path/to/project</code></pre>
+
+<p>On Windows PowerShell:</p>
+
+<pre><code class="language-powershell">Set-Location C:\path\to\project
+&amp; "C:\path\to\spec-elf\target\release\spec-elf.exe" .</code></pre>
+
+<p>
+  The resulting packed executable is named <code>spec-elf</code> on Linux or <code>spec-elf.exe</code> on Windows and is
+  placed in the project directory. Intermediate binaries are written to that project's <code>build/</code> directory.
+</p>
+
+<blockquote>
+  <strong>Host builds only:</strong> run <code>spec-elf</code> on Linux to package Linux executables and on Windows to
+  package Windows executables. Cross-compiling a package for another operating system is not currently supported.
+</blockquote>
+
+<h2>CPU variants</h2>
+
+<p>Every supported project is built for these targets:</p>
 
 <table>
   <thead>
     <tr>
       <th align="left">Variant</th>
-      <th align="left">Selection rule</th>
+      <th align="left">When it is selected</th>
     </tr>
   </thead>
   <tbody>
-    <tr>
-      <td><code>native</code></td>
-      <td>Chosen only when the runtime CPU fingerprint matches the machine used for the native build.</td>
-    </tr>
-    <tr>
-      <td><code>x86-64-v4</code></td>
-      <td>Selected for hosts that expose the v4 feature level.</td>
-    </tr>
-    <tr>
-      <td><code>x86-64-v3</code></td>
-      <td>Selected for v3 hosts when no matching native payload is available.</td>
-    </tr>
-    <tr>
-      <td><code>x86-64-v2</code></td>
-      <td>Selected for v2 hosts when higher levels are unavailable.</td>
-    </tr>
-    <tr>
-      <td><code>x86-64</code></td>
-      <td>Generic baseline fallback.</td>
-    </tr>
+    <tr><td><code>native</code></td><td>The CPU identity matches the machine that built the package.</td></tr>
+    <tr><td><code>x86-64-v4</code></td><td>The host supports the complete v4 feature set.</td></tr>
+    <tr><td><code>x86-64-v3</code></td><td>The host supports the complete v3 feature set.</td></tr>
+    <tr><td><code>x86-64-v2</code></td><td>The host supports the complete v2 feature set.</td></tr>
+    <tr><td><code>x86-64</code></td><td>Baseline fallback for any x86-64 host.</td></tr>
   </tbody>
 </table>
 
-<p>On first launch, the packed executable extracts the chosen payload, writes it under the launcher's filename in the current working directory, marks it executable, and starts it. The replacement payload is then a normal executable, so CPU detection is not repeated on later runs.</p>
+<p>
+  The launcher uses <code>native</code> only for a matching CPU. Otherwise, it selects the highest
+  compatible standardized x86-64 level.
+</p>
 
-<blockquote>
-  <p><strong>Current path behavior:</strong> extraction targets the current working directory, not necessarily the packed executable's own directory. Run the packed file from its output directory while the project is experimental.</p>
-</blockquote>
+<h2 id="supported-projects">Supported projects</h2>
 
-<h2>Supported project types</h2>
+<p>
+  <code>spec-elf</code> detects the project language by recursively counting source-file extensions.
+  It ignores <code>target/</code>, <code>build/</code>, and <code>.git/</code> directories.
+</p>
 
 <table>
   <thead>
     <tr>
       <th align="left">Language</th>
-      <th align="left">Build path</th>
-      <th align="left">Required tool</th>
+      <th align="left">Detected by</th>
+      <th align="left">Build behavior</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td>C</td>
-      <td>CMake when <code>CMakeLists.txt</code> exists; otherwise recursive source collection passed to <code>gcc</code>.</td>
-      <td><code>gcc</code>, optionally <code>cmake</code></td>
+      <td><strong>C</strong></td>
+      <td><code>.c</code></td>
+      <td>Uses CMake when <code>CMakeLists.txt</code> exists; otherwise uses <code>gcc -O3</code>.</td>
     </tr>
     <tr>
-      <td>C++</td>
-      <td>CMake when available; otherwise recursive <code>.cpp</code>, <code>.cc</code>, and <code>.cxx</code> collection passed to <code>g++</code>.</td>
-      <td><code>g++</code>, optionally <code>cmake</code></td>
+      <td><strong>C++</strong></td>
+      <td><code>.cpp</code>, <code>.cc</code>, <code>.cxx</code>, <code>.hpp</code>, <code>.hxx</code></td>
+      <td>Uses CMake when <code>CMakeLists.txt</code> exists; otherwise uses <code>g++ -O3</code>.</td>
     </tr>
     <tr>
-      <td>Rust</td>
-      <td>Five release builds with isolated target directories and per-variant <code>RUSTFLAGS</code>.</td>
-      <td><code>cargo</code> and <code>rustc</code></td>
+      <td><strong>Rust</strong></td>
+      <td><code>.rs</code></td>
+      <td>Finds the nearest <code>Cargo.toml</code>, builds in release mode, and sets <code>RUSTFLAGS</code> per target.</td>
     </tr>
     <tr>
-      <td>Zig</td>
-      <td>The first discovered <code>.zig</code> source is built five times with <code>ReleaseFast</code>.</td>
-      <td><code>zig</code></td>
+      <td><strong>Zig</strong></td>
+      <td><code>.zig</code></td>
+      <td>Builds the first Zig source with <code>zig build-exe -O ReleaseFast</code>.</td>
     </tr>
   </tbody>
 </table>
 
-<p>Language detection counts recognized source extensions recursively and chooses the most common language. The <code>target</code>, <code>build</code>, and <code>.git</code> directories are ignored.</p>
+<h3>Toolchain requirements</h3>
 
-<h2>Build spec-elf</h2>
+<ul>
+  <li>Rust and Cargo to build <code>spec-elf</code>.</li>
+  <li><code>gcc</code> or CMake with a GCC-compatible C compiler for C projects.</li>
+  <li><code>g++</code> or CMake with a GCC-compatible C++ compiler for C++ projects.</li>
+  <li>Cargo for Rust projects.</li>
+  <li>Zig for Zig projects.</li>
+</ul>
 
-<pre><code>cargo build --release</code></pre>
+<h2 id="how-it-works">How it works</h2>
 
-<p>The launcher is created at <code>target/release/spec-elf</code>.</p>
+<ol>
+  <li>Build five CPU-specific versions of the project.</li>
+  <li>Append those payloads and a manifest to the launcher.</li>
+  <li>Detect the current CPU's x86-64 feature level at runtime.</li>
+  <li>Extract the best matching payload to a temporary sibling file.</li>
+  <li>On Linux, atomically replace the launcher and execute the selected payload.</li>
+  <li>On Windows, run the temporary <code>.exe</code>, forward its exit code, and remove it afterward.</li>
+</ol>
 
-<h2>Package a project</h2>
+<p>
+  Linux permanently replaces the packed file after specialization. Windows keeps the packed launcher because the
+  operating system locks running executables. Both platforms require write access to the launcher's directory.
+  Runtime arguments are forwarded to the selected program. See
+  <a href="docs/format.md">the packed-format documentation</a> for the binary layout.
+</p>
 
-<p>Pass a project directory explicitly. Use <code>.</code> for the current directory:</p>
-
-<pre><code>cd /path/to/project
-/path/to/spec-elf/target/release/spec-elf .</code></pre>
-
-<p>Or package another directory:</p>
-
-<pre><code>/path/to/spec-elf/target/release/spec-elf /path/to/project</code></pre>
-
-<p>Intermediate variants are written below <code>build/</code>. The packed executable is named after the launcher—normally <code>spec-elf</code>—inside the target project directory.</p>
-
-<h2>Packed layout</h2>
-
-<table>
-  <tbody>
-    <tr>
-      <td>1</td>
-      <td>Launcher ELF</td>
-    </tr>
-    <tr>
-      <td>2</td>
-      <td>Five payload binaries</td>
-    </tr>
-    <tr>
-      <td>3</td>
-      <td>Manifest with each payload name, byte offset, and size</td>
-    </tr>
-    <tr>
-      <td>4</td>
-      <td>Footer containing <code>VPKFOOT\0</code>, manifest metadata, native CPU hash, and launch flag</td>
-    </tr>
-  </tbody>
-</table>
+<details>
+  <summary><strong>Current limitations</strong></summary>
+  <br>
+  <ul>
+    <li>Only x86-64 Linux and Windows are supported.</li>
+    <li>The packaging CLI accepts exactly one project-directory argument; packed programs may receive arbitrary runtime arguments.</li>
+    <li>The packaged output is named after the launcher binary, normally <code>spec-elf</code> or <code>spec-elf.exe</code>.</li>
+    <li>Packages are built for the host operating system; cross-OS packaging is not supported.</li>
+    <li>Direct C and C++ builds cannot supply custom libraries, linker flags, or complex include paths; use CMake for those projects.</li>
+    <li>C and C++ CPU variants currently require GCC-compatible <code>-march</code> flags; MSVC is not supported.</li>
+    <li>CMake packaging expects exactly one executable in its configured runtime output directory.</li>
+    <li>Rust supports the default binary or one explicit <code>[[bin]]</code>; multiple explicit binaries require a future selection option.</li>
+    <li>Zig currently builds the first <code>.zig</code> source found.</li>
+    <li>On Windows, remove an existing packed output before rebuilding it; Windows does not allow the final rename to replace an existing file.</li>
+  </ul>
+</details>
 
 <h2>Development</h2>
 
-<pre><code>cargo fmt --all --check
-cargo test
-cargo clippy --all-targets
-cargo run -- --help</code></pre>
+<table>
+  <thead>
+    <tr><th align="left">Task</th><th align="left">Command</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Run tests</td><td><code>cargo test</code></td></tr>
+    <tr><td>Show CLI help</td><td><code>cargo run -- --help</code></td></tr>
+    <tr><td>Package a project</td><td><code>cargo run -- /path/to/project</code></td></tr>
+    <tr><td>Fuzz the archive parser</td><td><code>cargo fuzz run archive</code> from <code>fuzz/</code></td></tr>
+  </tbody>
+</table>
 
-<h2>Experimental limitations</h2>
+<hr>
 
-<ul>
-  <li>Linux and x86-64 only.</li>
-  <li>Packaging creates build artifacts and replaces the target output filename; test in a disposable project first.</li>
-  <li>Rust package-name discovery currently reads the first matching <code>name = "..."</code> line instead of fully parsing Cargo metadata.</li>
-  <li>Zig support builds only the first discovered source file and does not use <code>build.zig</code>.</li>
-  <li>CMake projects must produce exactly one executable in the configured runtime output directory.</li>
-</ul>
-
-<div align="center">
-  <sub>Build once. Dispatch once. Run native.</sub>
-</div>
+<p align="center">
+  <strong>Experimental software.</strong><br>
+  Useful for testing CPU-specialized builds; not yet a general-purpose application packager.
+</p>

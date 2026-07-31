@@ -21,7 +21,13 @@ pub fn detect_x86_level() -> X86Level {
         return X86Level::X86_64;
     };
 
-    let has_v2 = fi.has_sse3() && fi.has_ssse3() && fi.has_sse41() && fi.has_sse42() && fi.has_popcnt() && fi.has_cmpxchg16b() && epfi.has_lahf_sahf();
+    let has_v2 = fi.has_sse3()
+        && fi.has_ssse3()
+        && fi.has_sse41()
+        && fi.has_sse42()
+        && fi.has_popcnt()
+        && fi.has_cmpxchg16b()
+        && epfi.has_lahf_sahf();
 
     if !has_v2 {
         return X86Level::X86_64;
@@ -31,13 +37,33 @@ pub fn detect_x86_level() -> X86Level {
         return X86Level::V2;
     };
 
-    let has_v3 = fi.has_avx() && fi.has_fma() && fi.has_f16c() && fi.has_movbe() && fi.has_xsave() && efi.has_avx2() && efi.has_bmi1() && efi.has_bmi2() && epfi.has_lzcnt();
+    let xcr0 = if fi.has_xsave() && fi.has_oxsave() {
+        Some(unsafe { std::arch::x86_64::_xgetbv(0) })
+    } else {
+        None
+    };
+    let has_avx_state = xcr0.is_some_and(|value| value & 0b110 == 0b110);
+    let has_v3 = fi.has_avx()
+        && fi.has_fma()
+        && fi.has_f16c()
+        && fi.has_movbe()
+        && has_avx_state
+        && efi.has_avx2()
+        && efi.has_bmi1()
+        && efi.has_bmi2()
+        && epfi.has_lzcnt();
 
     if !has_v3 {
         return X86Level::V2;
     }
 
-    let has_v4 = efi.has_avx512f() && efi.has_avx512bw() && efi.has_avx512cd() && efi.has_avx512dq() && efi.has_avx512vl();
+    let has_avx512_state = xcr0.is_some_and(|value| value & 0b1110_0110 == 0b1110_0110);
+    let has_v4 = has_avx512_state
+        && efi.has_avx512f()
+        && efi.has_avx512bw()
+        && efi.has_avx512cd()
+        && efi.has_avx512dq()
+        && efi.has_avx512vl();
 
     if has_v4 { X86Level::V4 } else { X86Level::V3 }
 }
@@ -46,7 +72,9 @@ pub fn native_hasher() -> Option<u64> {
     let cpuid = CpuId::new();
 
     let vendor = cpuid.get_vendor_info().map(|v| v.as_str().trim().to_string())?;
-    let brand = cpuid.get_processor_brand_string().map(|b| b.as_str().trim().to_string())?;
+    let brand = cpuid
+        .get_processor_brand_string()
+        .map(|b| b.as_str().trim().to_string())?;
 
     let mut parts = Vec::new();
 
@@ -54,7 +82,14 @@ pub fn native_hasher() -> Option<u64> {
     parts.push(format!("target_os={}", std::env::consts::OS));
     parts.push(format!("target_family={}", std::env::consts::FAMILY));
     parts.push(format!("target_pointer_width={}", std::mem::size_of::<usize>() * 8));
-    parts.push(format!("target_endian={}", if cfg!(target_endian = "little") { "little" } else { "big" }));
+    parts.push(format!(
+        "target_endian={}",
+        if cfg!(target_endian = "little") {
+            "little"
+        } else {
+            "big"
+        }
+    ));
 
     parts.push(format!("cpu_vendor={vendor}"));
     parts.push(format!("cpu_brand={brand}"));
@@ -85,6 +120,11 @@ pub fn native_hasher() -> Option<u64> {
         push_feature(&mut parts, "osxsave", fi.has_oxsave());
         push_feature(&mut parts, "avx", fi.has_avx());
         push_feature(&mut parts, "cmpxchg16b", fi.has_cmpxchg16b());
+
+        if fi.has_xsave() && fi.has_oxsave() {
+            let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
+            parts.push(format!("xcr0={xcr0}"));
+        }
     }
 
     if let Some(epfi) = cpuid.get_extended_processor_and_feature_identifiers() {
